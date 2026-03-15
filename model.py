@@ -31,6 +31,39 @@ class GRU_unit(nn.Module):
         new_h = self.gru_cell(x, h)
         return new_h
 
+class AbsSubgrad(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        ctx.save_for_backward(x)
+        return x.abs()
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (x,) = ctx.saved_tensors
+        # subgradient of |x|: sign(x); choose sign(0)=1 to avoid "stuck at 0"
+        grad_x = grad_output * torch.where(x >= 0, torch.ones_like(x), -torch.ones_like(x))
+        return grad_x
+
+def abs_subgrad(x):
+    return AbsSubgrad.apply(x)
+class HardGateSTE(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, delta):
+        # forward: hard threshold exactly matches (delta > 0)
+        ctx.save_for_backward(delta)
+        return (delta > 0).to(delta.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        (delta,) = ctx.saved_tensors
+        # surrogate gradient: use sigmoid derivative as a smooth proxy
+        sg = torch.sigmoid(delta)
+        grad_delta = grad_output * sg * (1 - sg)
+        return grad_delta
+
+def hard_gate_ste(delta):
+    return HardGateSTE.apply(delta)
+
 class SGRU_unit(nn.Module):
     def __init__(self, latent_dim, input_dim, n_units=100, device=torch.device("cpu")):
         super(SGRU_unit, self).__init__()
@@ -48,14 +81,11 @@ class SGRU_unit(nn.Module):
         h_tilde = self.gru_cell(x, h_ode)
         
         abs_difference = torch.abs(h_tilde - h_prev) 
-        dynamic_threshold = torch.abs(h_prev) * torch.abs(self.s)
-        update_condition = abs_difference > dynamic_threshold  
+        dynamic_threshold = torch.abs(h_prev) * abs_subgrad(self.s)
+        delta = abs_difference - dynamic_threshold
+        gate = hard_gate_ste(delta)
         
-        h = torch.where(
-            update_condition, 
-            h_tilde,          
-            h_prev             
-        )
+        h = gate * h_tilde + (1 - gate) * h_prev
         
         return h
 
